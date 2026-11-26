@@ -171,7 +171,8 @@ const SYSTEM_INSTRUCTIONS = `당신은 대한민국 고등학생을 돕는 따�
 4. 모든 제안은 반드시 학생이 실제로 고른 답변을 근거로 연결해 설명하세요. "아직 잘 모르겠어요" 응답이 많다면 부족함으로 평가하지 말고, 탐색을 시작하는 자연스러운 과정으로 존중하며 폭넓은 탐색 활동과 질문을 제안하세요.
 5. 확인되지 않은 특정 대학명, 학과 입시 요강, 기업명, 채용 정보, 연봉·합격선 수치를 사실처럼 제시하지 마세요.
 6. 정식 심리검사나 적성검사 결과가 아니라 자기이해를 돕기 위한 참고자료임을 분명히 안내하세요.
-7. 최종 결정은 학생 본인에게 있음을 강조하고, 학생이 다음 탐색 활동을 스스로 고를 수 있도록 도와주세요.`;
+7. 최종 결정은 학생 본인에게 있음을 강조하고, 학생이 다음 탐색 활동을 스스로 고를 수 있도록 도와주세요.
+8. 각 항목은 고등학생이 한눈에 읽기 좋게 핵심 위주로 간결하고 명확하게 작성하세요.`;
 
 function getClientIp(req: VercelRequest): string {
   const forwarded = req.headers['x-forwarded-for'];
@@ -348,20 +349,108 @@ function formatAnswersForPrompt(answers: ValidatedAnswerItem[]): string {
   return `아래는 고등학생이 자기이해 15문항에 응답한 결과입니다.\n\n${lines.join('\n\n')}`;
 }
 
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+function isNonEmptyStringArray(value: unknown): value is string[] {
+  return (
+    Array.isArray(value) &&
+    value.length > 0 &&
+    value.every((item) => isNonEmptyString(item))
+  );
+}
+
 function isValidReport(data: unknown): data is CareerReport {
   if (!data || typeof data !== 'object' || Array.isArray(data)) return false;
   const r = data as Record<string, unknown>;
-  return (
-    typeof r.headline === 'string' &&
-    typeof r.traitSummary === 'string' &&
-    Array.isArray(r.keyCharacteristics) &&
-    Array.isArray(r.recommendedFields) &&
-    r.recommendedFields.length >= 2 &&
-    Array.isArray(r.reflectionQuestions) &&
-    Array.isArray(r.suggestedActivities) &&
-    typeof r.selfDecisionPrompt === 'string' &&
-    typeof r.referenceNotice === 'string'
-  );
+
+  if (
+    !isNonEmptyString(r.headline) ||
+    !isNonEmptyString(r.traitSummary) ||
+    !isNonEmptyStringArray(r.keyCharacteristics) ||
+    !isNonEmptyStringArray(r.reflectionQuestions) ||
+    !isNonEmptyString(r.selfDecisionPrompt) ||
+    !isNonEmptyString(r.referenceNotice)
+  ) {
+    return false;
+  }
+
+  if (!Array.isArray(r.recommendedFields) || r.recommendedFields.length < 2) {
+    return false;
+  }
+
+  for (const field of r.recommendedFields) {
+    if (!field || typeof field !== 'object' || Array.isArray(field)) return false;
+    const f = field as Record<string, unknown>;
+    if (
+      !isNonEmptyString(f.fieldName) ||
+      !isNonEmptyString(f.summary) ||
+      !isNonEmptyString(f.reasonFromAnswers) ||
+      !isNonEmptyStringArray(f.relatedEvidence) ||
+      !isNonEmptyString(f.cautionOrNote)
+    ) {
+      return false;
+    }
+  }
+
+  if (!Array.isArray(r.suggestedActivities) || r.suggestedActivities.length === 0) {
+    return false;
+  }
+
+  for (const activity of r.suggestedActivities) {
+    if (!activity || typeof activity !== 'object' || Array.isArray(activity)) return false;
+    const a = activity as Record<string, unknown>;
+    if (
+      !isNonEmptyString(a.title) ||
+      !isNonEmptyString(a.description) ||
+      !isNonEmptyString(a.howToStart)
+    ) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function extractResponseText(response: OpenAI.Responses.Response): {
+  text: string;
+  refusal?: string;
+} {
+  const directText = response.output_text?.trim();
+  if (directText) {
+    return { text: directText };
+  }
+
+  const textParts: string[] = [];
+  let refusalText: string | undefined;
+
+  for (const item of response.output ?? []) {
+    if (item.type !== 'message') continue;
+    for (const part of item.content ?? []) {
+      if (part.type === 'output_text' && part.text) {
+        textParts.push(part.text);
+      } else if (part.type === 'refusal' && part.refusal) {
+        refusalText = part.refusal;
+      }
+    }
+  }
+
+  return {
+    text: textParts.join('').trim(),
+    refusal: refusalText,
+  };
+}
+
+function stripJsonCodeFence(raw: string): string {
+  const trimmed = raw.trim();
+  if (trimmed.startsWith('```')) {
+    return trimmed
+      .replace(/^```(?:json)?\s*/i, '')
+      .replace(/\s*```$/, '')
+      .trim();
+  }
+  return trimmed;
 }
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
@@ -478,7 +567,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       },
       instructions: SYSTEM_INSTRUCTIONS,
       input: formatAnswersForPrompt(validation.answers),
-      max_output_tokens: 2000,
+      max_output_tokens: 4096,
       store: false,
       text: {
         format: {
@@ -490,7 +579,41 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       },
     });
 
-    const rawOutput = response.output_text?.trim();
+    if (response.error) {
+      return res.status(502).json({
+        error: 'AI 모델이 응답을 생성하는 중 오류가 발생했습니다. 잠시 후 다시 시도해주세요.',
+        code: 'OPENAI_RESPONSE_ERROR',
+      });
+    }
+
+    if (response.status === 'incomplete') {
+      const reason = response.incomplete_details?.reason;
+      const message =
+        reason === 'max_output_tokens'
+          ? 'AI 리포트 응답이 길어 중간에 잘렸습니다. 다시 시도해주세요.'
+          : 'AI 리포트 응답이 끝까지 완료되지 않았습니다. 다시 시도해주세요.';
+      return res.status(502).json({
+        error: message,
+        code: 'AI_RESPONSE_INCOMPLETE',
+      });
+    }
+
+    if (response.status && response.status !== 'completed') {
+      return res.status(502).json({
+        error: 'AI 리포트 생성이 완료되지 않았습니다. 잠시 후 다시 시도해주세요.',
+        code: 'AI_RESPONSE_NOT_COMPLETED',
+      });
+    }
+
+    const { text: extractedText, refusal } = extractResponseText(response);
+    if (refusal) {
+      return res.status(502).json({
+        error: '요청을 처리할 수 있는 리포트를 생성하지 못했습니다. 응답 내용을 확인한 뒤 다시 시도해주세요.',
+        code: 'AI_RESPONSE_REFUSAL',
+      });
+    }
+
+    const rawOutput = stripJsonCodeFence(extractedText);
     if (!rawOutput) {
       return res.status(502).json({
         error: 'AI 응답에서 결과 텍스트를 받지 못했습니다. 잠시 후 다시 시도해주세요.',

@@ -101,9 +101,21 @@ export async function requestCareerReport(
   }
 
   const successBody = data as Partial<ChatApiResponse>;
-  if (!successBody?.report) {
+  const report = successBody?.report;
+  if (
+    !report ||
+    typeof report.headline !== 'string' ||
+    typeof report.traitSummary !== 'string' ||
+    !Array.isArray(report.keyCharacteristics) ||
+    !Array.isArray(report.recommendedFields) ||
+    report.recommendedFields.length < 2 ||
+    !Array.isArray(report.reflectionQuestions) ||
+    !Array.isArray(report.suggestedActivities) ||
+    typeof report.selfDecisionPrompt !== 'string' ||
+    typeof report.referenceNotice !== 'string'
+  ) {
     throw new CareerApiError(
-      '리포트 데이터가 비어 있습니다. 다시 시도해주세요.',
+      '리포트 형식이 올바르지 않거나 비어 있습니다. 다시 시도해주세요.',
       502,
       'EMPTY_REPORT'
     );
